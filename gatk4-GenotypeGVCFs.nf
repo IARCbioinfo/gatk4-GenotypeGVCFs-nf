@@ -48,9 +48,6 @@ if (params.help)
     log.info "--hapmap                        VCF FILE                  hapmap VCF file"
     log.info "--omni                          VCF FILE                  1000G omni VCF file"
     log.info "--onekg                         VCF FILE                  1000G phase1 snps high confidence VCF file"
-    log.info ""
-    log.info "Optional arguments:"
-    log.info "--interval_list                 INTERVAL_LIST FILE        Interval.list file For target"
     exit 1
 }
 
@@ -62,25 +59,12 @@ params.output_dir    = "."
 params.cohort        = "cohort"
 params.ref_fasta     = null
 params.gatk_exec     = null
-params.interval_list = null
 params.dbsnp         = null
 params.mills         = null
 params.axiom         = null
 params.hapmap        = null
 params.omni          = null
 params.onekg         = null
-
-//
-// Optional Argument Treatment
-//
-if (params.interval_list)
-{
-	interval_list_arg = "-L ${params.interval_list} "
-}
-else
-{
-	interval_list_arg = " "
-}
 
 //
 // Parse Input Parameters
@@ -91,6 +75,7 @@ gvcf_ch = Channel
 gvcf_idx_ch = Channel
 			.fromPath(params.input)
 			.map { file -> file+".idx" }
+
 			
 GATK                              = params.gatk_exec
 ref                               = file(params.ref_fasta)
@@ -105,55 +90,62 @@ one_thousand_genomes_resource_vcf = file(params.onekg)
 // than a z-score of -4.5 which is a p-value of 3.4e-06, which phred-scaled is 54.69
 excess_het_threshold = 54.69
 
+// Store the chromosomes in a channel for easier workload scattering on large cohort
+chromosomes_ch = Channel
+    .from( "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "chrY" )
+
+
+
 //
-// Process launching GenomicsDBImport to gather all VCFs
+// Process launching GenomicsDBImport to gather all VCFs, per chromosome
 //
 process GenomicsDBImport {
 
-	cpus 4 
-	memory '24 GB'
+	cpus 1 
+	memory '72 GB'
 	time '12h'
 	
-	tag "${params.cohort}"
+	tag { chr }
 
     input:
-	file (gvcf) from gvcf_ch.toList()
-	file (gvcf_idx) from gvcf_idx_ch.toList()
+	each chr from chromosomes_ch
+    file (gvcf) from gvcf_ch.collect()
+	file (gvcf_idx) from gvcf_idx_ch.collect()
 
 	output:
-    file "*.tar" into gendb_ch
+    set chr, file ("${params.cohort}.${chr}.tar") into gendb_ch
 	
     script:
 	"""
-	${GATK} GenomicsDBImport --java-options "-Xmx4g -Xms4g" \
+	${GATK} GenomicsDBImport --java-options "-Xmx24g -Xms24g" \
 	${gvcf.collect { "-V $it " }.join()} \
-	$interval_list_arg \
-	--genomicsdb-workspace-path ${params.cohort}
+    -L ${chr} \
+	--genomicsdb-workspace-path ${params.cohort}.${chr}
 	
-	tar -cf ${params.cohort}.tar ${params.cohort}
+	tar -cf ${params.cohort}.${chr}.tar ${params.cohort}.${chr}
 	"""
 }	
 
 
 
 //
-// Process launching GenotypeGVCFs on the previously created genDB
+// Process launching GenotypeGVCFs on the previously created genDB, per chromosome
 //
 process GenotypeGVCFs {
 
 	cpus 4 
-	memory '24 GB'
-	time '12h'
+	memory '48 GB'
+	time '20h'
 	
-	tag "${params.cohort}"
+	tag { chr }
 
 	publishDir params.output_dir, mode: 'copy'
 
     input:
-	file (workspace_tar) from gendb_ch
+	set chr, file (workspace_tar) from gendb_ch
 
 	output:
-    set file("${params.cohort}.vcf"), file("${params.cohort}.vcf.idx") into vcf_ch
+    set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
 
     script:
 	"""
@@ -163,13 +155,13 @@ process GenotypeGVCFs {
     ${GATK} --java-options "-Xmx5g -Xms5g" \
      GenotypeGVCFs \
      -R ${ref} \
-     -O ${params.cohort}.vcf \
+     -O ${params.cohort}.${chr}.vcf \
      -D ${dbsnp_resource_vcf} \
      -G StandardAnnotation \
      --only-output-calls-starting-in-intervals \
      --use-new-qual-calculator \
      -V gendb://\$WORKSPACE \
-     $interval_list_arg
+     -L ${chr}
 
 	"""
 }	
@@ -177,7 +169,7 @@ process GenotypeGVCFs {
 
 
 //
-// Process Hard Filtering on ExcessHet
+// Process Hard Filtering on ExcessHet, per chromosome
 //
 process HardFilter {
 
@@ -185,13 +177,14 @@ process HardFilter {
 	memory '24 GB'
 	time '12h'
 	
-	tag "${params.cohort}"
+	tag { chr }
 
     input:
-	set file (vcf), file (vcfidx) from vcf_ch
+	set chr, file (vcf), file (vcfidx) from vcf_ch
 
 	output:
-    set file("${params.cohort}.filtered.vcf"), file("${params.cohort}.filtered.vcf.idx") into (vcf_snv_ch, vcf_sid_ch, vcf_recal_ch)
+    file("${params.cohort}.${chr}.filtered.vcf") into (vcf_hf_ch)
+    file("${params.cohort}.${chr}.filtered.vcf.idx") into (vcf_idx_hf_ch)
 
     script:
 	"""
@@ -199,12 +192,54 @@ process HardFilter {
       VariantFiltration \
       --filter-expression "ExcessHet > ${excess_het_threshold}" \
       --filter-name ExcessHet \
-      --exclude-filtered \
       -V ${vcf} \
-      -O ${params.cohort}.filtered.vcf
+      -O ${params.cohort}.${chr}.markfiltered.vcf
+
+	${GATK} --java-options "-Xmx3g -Xms3g" \
+      SelectVariants \
+      --exclude-filtered \
+      -V ${params.cohort}.${chr}.markfiltered.vcf \
+      -O ${params.cohort}.${chr}.filtered.vcf
 
 	"""
 }	
+
+
+
+process GatherVcfs {
+
+	cpus 1
+	memory '48 GB'
+	time '12h'
+	
+	tag "${params.cohort}"
+
+    input:
+    file (vcf) from vcf_hf_ch.collect()
+	file (vcf_idx) from vcf_idx_hf_ch.collect()
+
+	output:
+    set file("${params.cohort}.vcf"), file("${params.cohort}.vcf.idx") into (vcf_snv_ch, vcf_sid_ch, vcf_recal_ch)
+
+    // WARNING : complicated channel extraction! 
+    // GATK GatherVcfs only accepts as input VCF in the chromosomical order. Nextflow/Groovy list are not sorted. The following command does :
+    // 1 : look for all VCF with "chr[0-9]*" in the filename (\d+ means 1 or + digits)
+    // 2 : Tokenize the filenames with "." as the separator, keep the 2nd item (indexed [1]) "chr[0-9]*"
+    // 3 : Take from the 3rd character till the end of the string "chr[0-9]*", ie the chromosome number
+    // 4 : Cast it from a string to an integer (to force a numerical sort)
+    // 5 : Sort 
+    // 6 : Add chrX and chrY to the list
+
+    script:
+	"""
+	${GATK} --java-options "-Xmx3g -Xms3g" \
+      GatherVcfs \
+      ${vcf.findAll{ it=~/chr\d+/ }.collect().sort{ it.name.tokenize('.')[1].substring(3).toInteger() }.plus(vcf.find{ it=~/chrX/ }).plus(vcf.find{ it=~/chrY/ }).collect{ "--INPUT $it " }.join() } \
+      --OUTPUT ${params.cohort}.vcf
+
+	"""
+}	
+
 
 
 //
