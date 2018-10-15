@@ -26,7 +26,6 @@ Whole cohort variant calling (joint genotyping).
 - `--hapmap` : hapmap VCF file. 
 - `--omni` :1000G omni VCF file. 
 - `--gatk_exec` : the full path to your GATK4 binary file.
-- `--interval_list` : file for the intervals to call on. [More information on interval_list format](https://gatkforums.broadinstitute.org/gatk/discussion/1319/collected-faqs-about-interval-lists).
 
 A nextflow.config is also included, please modify it for suitability outside our pre-configured clusters ([see Nexflow configuration](https://www.nextflow.io/docs/latest/config.html#configuration-file)).
 
