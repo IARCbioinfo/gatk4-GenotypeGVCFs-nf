@@ -92,8 +92,7 @@ excess_het_threshold = 54.69
 
 // Store the chromosomes in a channel for easier workload scattering on large cohort
 chromosomes_ch = Channel
-    .from( "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "chrY" )
-
+    .from( "chr1", "chr2", "chr3","chr4" ,"chr5", "chr6", "chr7", "chr8", "chr9", "chr10" ,"chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "chrY" )
 
 
 //
@@ -102,9 +101,13 @@ chromosomes_ch = Channel
 process GenomicsDBImport {
 
 	cpus 1 
-	memory '72 GB'
-	time '12h'
-	
+
+    time { (10.hour + (2.hour * task.attempt)) } // First attempt 12h, second 14h, etc
+    memory { (64.GB + (8.GB * task.attempt)) } // First attempt 72GB, second 80GB, etc
+
+    errorStrategy 'retry'
+    maxRetries 3
+
 	tag { chr }
 
     input:
@@ -113,19 +116,19 @@ process GenomicsDBImport {
 	file (gvcf_idx) from gvcf_idx_ch.collect()
 
 	output:
-    set chr, file ("${params.cohort}.${chr}.tar") into gendb_ch
+    set chr, file ("${params.cohort}.${chr}") into gendb_ch
 	
     script:
 	"""
-	${GATK} GenomicsDBImport --java-options "-Xmx24g -Xms24g" \
+	${GATK} GenomicsDBImport --java-options "-Xmx24g -Xms24g -Djava.io.tmpdir=/tmp" \
 	${gvcf.collect { "-V $it " }.join()} \
     -L ${chr} \
+    --batch-size 50 \
+    --tmp-dir=/tmp \
 	--genomicsdb-workspace-path ${params.cohort}.${chr}
 	
-	tar -cf ${params.cohort}.${chr}.tar ${params.cohort}.${chr}
 	"""
 }	
-
 
 
 //
@@ -139,22 +142,31 @@ process GenotypeGVCFs {
 	
 	tag { chr }
 
-	publishDir params.output_dir, mode: 'copy'
+	publishDir params.output_dir, mode: 'copy', pattern: '*.{vcf,idx}'
 
     input:
-	set chr, file (workspace_tar) from gendb_ch
+	set chr, file (workspace) from gendb_ch
+   	file genome from ref
 
 	output:
     set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
+    file "${genome}.fai" into faidx_sid_ch,faidx_snv_ch
+	file "${genome.baseName}.dict" into dict_sid_ch,dict_snv_ch
 
     script:
 	"""
-	tar -xf ${workspace_tar}
-    WORKSPACE=\$( basename ${workspace_tar} .tar)
+    samtools faidx ${genome}
+
+    java -jar \$PICARD_TOOLS_LIBDIR/picard.jar \
+    CreateSequenceDictionary \
+    R=${genome} \
+    O=${genome.baseName}.dict
+
+    WORKSPACE=\$( basename ${workspace} )
 
     ${GATK} --java-options "-Xmx5g -Xms5g" \
      GenotypeGVCFs \
-     -R ${ref} \
+     -R ${genome} \
      -O ${params.cohort}.${chr}.vcf \
      -D ${dbsnp_resource_vcf} \
      -G StandardAnnotation \
@@ -165,7 +177,6 @@ process GenotypeGVCFs {
 
 	"""
 }	
-
 
 
 //
@@ -255,6 +266,9 @@ process SID_VariantRecalibrator {
 
     input:
 	set file (vcf), file (vcfidx) from vcf_sid_ch
+    file genome from ref
+    file faidx from faidx_sid_ch
+    file dict from dict_sid_ch
 
 	output:
     set file("${params.cohort}.sid.recal"),file("${params.cohort}.sid.recal.idx"),file("${params.cohort}.sid.tranches") into sid_recal_ch
@@ -263,7 +277,7 @@ process SID_VariantRecalibrator {
 	"""
     ${GATK} --java-options "-Xmx24g -Xms24g" \
       VariantRecalibrator \
-      -R ${ref} \
+      -R ${genome} \
       -V ${vcf} \
       --output ${params.cohort}.sid.recal \
       --tranches-file ${params.cohort}.sid.tranches \
@@ -293,6 +307,9 @@ process SNV_VariantRecalibrator {
 
     input:
 	set file (vcf), file (vcfidx) from vcf_snv_ch
+    file genome from ref
+    file faidx from faidx_snv_ch
+    file dict from dict_snv_ch
 
 	output:
     set file("${params.cohort}.snv.recal"),file("${params.cohort}.snv.recal.idx"),file("${params.cohort}.snv.tranches") into snv_recal_ch
@@ -301,7 +318,7 @@ process SNV_VariantRecalibrator {
 	"""
     ${GATK} --java-options "-Xmx90g -Xms90g" \
       VariantRecalibrator \
-      -R ${ref} \
+      -R ${genome} \
       -V ${vcf} \
       --output ${params.cohort}.snv.recal \
       --tranches-file ${params.cohort}.snv.tranches \
